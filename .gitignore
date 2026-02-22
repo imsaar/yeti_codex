@@ -1,0 +1,7 @@
+.pio/
+.vscode/
+__pycache__/
+*.pyc
+
+# Local Wi-Fi secrets (never commit)
+include/wifi_secrets.h
