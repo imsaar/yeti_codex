@@ -632,58 +632,131 @@ void drawEyes(int y, int h, int curve, bool closed) {
   display.drawRBox(rightX, y, eyeW, h, curve);
 }
 
-void drawMouthLine(int y, int w, bool smile) {
+void drawPupils(int y, int h, int offsetX) {
+  if (h < 8) return;
+  const int leftCenterX = 40 + offsetX;
+  const int rightCenterX = 88 + offsetX;
+  const int centerY = y + h / 2;
+  display.drawDisc(leftCenterX, centerY, 2);
+  display.drawDisc(rightCenterX, centerY, 2);
+  // Tiny glint makes eyes look less flat.
+  display.drawPixel(leftCenterX - 1, centerY - 1);
+  display.drawPixel(rightCenterX - 1, centerY - 1);
+}
+
+void drawBrows(int leftX1, int leftY1, int leftX2, int leftY2, int rightX1, int rightY1, int rightX2,
+               int rightY2) {
+  display.drawLine(leftX1, leftY1, leftX2, leftY2);
+  display.drawLine(rightX1, rightY1, rightX2, rightY2);
+}
+
+void drawMouthFlat(int y, int w) {
   int x = (128 - w) / 2;
   display.drawHLine(x, y, w);
+}
 
-  if (smile) {
-    display.drawPixel(x, y - 1);
-    display.drawPixel(x + w - 1, y - 1);
-  } else {
-    display.drawPixel(x, y + 1);
-    display.drawPixel(x + w - 1, y + 1);
+void drawMouthSmile(int y, int w) {
+  int x = (128 - w) / 2;
+  display.drawLine(x, y, x + w / 2, y + 3);
+  display.drawLine(x + w / 2, y + 3, x + w, y);
+  display.drawPixel(x + 1, y + 1);
+  display.drawPixel(x + w - 1, y + 1);
+}
+
+void drawMouthFrown(int y, int w) {
+  int x = (128 - w) / 2;
+  display.drawLine(x, y + 3, x + w / 2, y);
+  display.drawLine(x + w / 2, y, x + w, y + 3);
+  display.drawPixel(x + 1, y + 2);
+  display.drawPixel(x + w - 1, y + 2);
+}
+
+void drawMouthOpen(int cx, int cy, int r) {
+  display.drawCircle(cx, cy, r);
+  if (r >= 5) {
+    display.drawCircle(cx, cy, r - 1);
   }
+}
+
+void drawCheeks() {
+  display.drawDisc(22, 42, 1);
+  display.drawDisc(26, 44, 1);
+  display.drawDisc(106, 42, 1);
+  display.drawDisc(102, 44, 1);
 }
 
 void drawFace() {
   display.clearBuffer();
 
-  uint32_t now = millis();
   bool closed = blinkClosed || currentEmotion == Emotion::Sleepy;
+  uint32_t now = millis();
+  int glance = static_cast<int>((now / 400UL) % 3UL) - 1;  // -1, 0, 1 subtle scanning look
 
   switch (currentEmotion) {
     case Emotion::Happy:
-      drawEyes(16, 14, 5, closed);
-      drawMouthLine(43, 26, true);
+      drawEyes(15, 15, 5, closed);
+      if (!closed) {
+        drawPupils(15, 15, glance);
+      }
+      drawBrows(30, 12, 48, 10, 78, 10, 96, 12);
+      drawCheeks();
+      drawMouthSmile(41, 26);
       break;
     case Emotion::Sad:
       drawEyes(18, 10, 4, closed);
-      drawMouthLine(44, 24, false);
+      if (!closed) {
+        drawPupils(18, 10, 0);
+      }
+      drawBrows(28, 11, 48, 16, 80, 16, 100, 11);
+      drawMouthFrown(43, 24);
+      display.drawPixel(25, 36);
+      display.drawPixel(103, 36);
       break;
     case Emotion::Sleepy:
-      drawEyes(23, 4, 2, true);
-      drawMouthLine(45, 16, false);
+      drawEyes(24, 4, 2, true);
+      display.drawLine(30, 20, 50, 20);
+      display.drawLine(78, 20, 98, 20);
+      drawMouthFlat(46, 14);
+      display.drawPixel(64, 50);
       break;
     case Emotion::Angry:
       drawEyes(18, 12, 2, closed);
-      display.drawLine(26, 15, 48, 11);
-      display.drawLine(102, 15, 80, 11);
-      drawMouthLine(43, 20, false);
+      if (!closed) {
+        drawPupils(18, 12, 0);
+      }
+      drawBrows(25, 14, 49, 9, 103, 14, 79, 9);
+      drawMouthFlat(44, 22);
+      display.drawLine(52, 47, 76, 47);
+      display.drawLine(52, 48, 76, 48);
       break;
     case Emotion::Surprised:
       drawEyes(14, 18, 9, closed);
-      display.drawCircle(64, 45, 6);
+      if (!closed) {
+        drawPupils(14, 18, 0);
+      }
+      drawBrows(30, 10, 48, 9, 78, 9, 96, 10);
+      drawMouthOpen(64, 45, 6);
       break;
     case Emotion::Thinking:
       drawEyes(17, 11, 4, closed);
-      display.drawDisc(56, 43, 2);
-      display.drawDisc(63, 45, 3);
-      display.drawDisc(72, 48, 4);
+      if (!closed) {
+        drawPupils(17, 11, -1);
+      }
+      drawBrows(29, 12, 47, 11, 78, 12, 97, 14);
+      drawMouthFlat(44, 14);
+      display.drawDisc(54, 43, 1);
+      display.drawDisc(61, 45, 2);
+      display.drawDisc(71, 48, 3);
+      display.drawCircle(80, 50, 4);
       break;
     case Emotion::Neutral:
     default:
       drawEyes(17, 12, 5, closed);
-      drawMouthLine(43, 18, false);
+      if (!closed) {
+        drawPupils(17, 12, 0);
+      }
+      drawBrows(30, 12, 48, 12, 78, 12, 96, 12);
+      drawMouthFlat(44, 18);
       break;
   }
 
