@@ -7,8 +7,6 @@
 #include <WiFi.h>
 #include <Wire.h>
 #include <stdlib.h>
-#include <sys/time.h>
-#include <time.h>
 
 #include "config.h"
 
@@ -49,30 +47,20 @@ Reminder reminders[kMaxReminders];
 
 String infoTemperature = "Loading...";
 int infoWeatherCode = -1;
-bool infoTimeValid = false;
 bool infoTempValid = false;
-bool ntpConfigured = false;
 bool infoUseFahrenheit = true;
 double infoLatitude = 47.6062;
 double infoLongitude = -122.3321;
 bool infoHasCoordinates = true;
-long infoUtcOffsetSeconds = -8L * 3600L;  // Seattle default (PST) until weather sync updates.
-String infoTimezoneId = "America/Los_Angeles";
-time_t infoUtcEpochAtSync = 0;
-uint32_t infoTimeSyncMs = 0;
-uint32_t lastInfoTimeFetchMs = 0;
 uint32_t lastInfoTempFetchMs = 0;
 
-int debugLastTimezoneCode = -1;
-int debugLastWorldTimeCode = -1;
 int debugLastWeatherCode = -1;
-String debugLastTimezonePayload = "";
-String debugLastWorldTimePayload = "";
 String debugLastWeatherPayload = "";
 
-static constexpr uint32_t kInfoTimeRefreshMs = 5UL * 60UL * 1000UL;
 static constexpr uint32_t kInfoTempRefreshMs = 10UL * 60UL * 1000UL;
 static constexpr uint32_t kInfoRetryMs = 20UL * 1000UL;
+static constexpr uint32_t kFaceRefreshMs = 33UL;
+static constexpr uint32_t kInfoDisplayRefreshMs = 1000UL;
 
 uint32_t nextBlinkMs = 0;
 uint32_t blinkUntilMs = 0;
@@ -172,132 +160,6 @@ String htmlEscape(const String& input) {
 String truncateForDebug(const String& input, size_t maxLen = 220) {
   if (input.length() <= maxLen) return input;
   return input.substring(0, maxLen) + "...";
-}
-
-bool currentInfoTm(struct tm& outTm) {
-  if (!infoTimeValid) return false;
-  uint32_t elapsed = (millis() - infoTimeSyncMs) / 1000UL;
-  time_t utcNow = infoUtcEpochAtSync + static_cast<time_t>(elapsed);
-  time_t localNow = utcNow + static_cast<time_t>(infoUtcOffsetSeconds);
-  gmtime_r(&localNow, &outTm);
-  return true;
-}
-
-String currentInfoTimeString() {
-  struct tm tmLocal;
-  if (!currentInfoTm(tmLocal)) return "--:--:--";
-  char buf[10];
-  snprintf(buf, sizeof(buf), "%02d:%02d:%02d", tmLocal.tm_hour, tmLocal.tm_min, tmLocal.tm_sec);
-  return String(buf);
-}
-
-String currentInfoDisplayClock() {
-  struct tm tmLocal;
-  if (!currentInfoTm(tmLocal)) return "--:--";
-
-  int hour24 = tmLocal.tm_hour;
-  int hour12 = hour24 % 12;
-  if (hour12 == 0) hour12 = 12;
-  char buf[6];
-  snprintf(buf, sizeof(buf), "%02d:%02d", hour12, tmLocal.tm_min);
-  return String(buf);
-}
-
-String currentInfoMeridiem() {
-  struct tm tmLocal;
-  if (!currentInfoTm(tmLocal)) return "-";
-  return tmLocal.tm_hour >= 12 ? "P" : "A";
-}
-
-bool syncNtpTime(bool waitForSync = false) {
-  if (WiFi.status() != WL_CONNECTED) return false;
-  if (!ntpConfigured) {
-    // Clear any stale RTC epoch so we only accept fresh NTP-provided time.
-    struct timeval tv = {0, 0};
-    settimeofday(&tv, nullptr);
-    configTime(0, 0, "time.nist.gov", "pool.ntp.org", "time.google.com");
-    ntpConfigured = true;
-  }
-
-  if (waitForSync) {
-    uint32_t started = millis();
-    time_t probe = time(nullptr);
-    while (probe < 1700000000 && millis() - started < 20000) {
-      delay(200);
-      probe = time(nullptr);
-    }
-  }
-
-  time_t utcNow = time(nullptr);
-  if (utcNow < 1700000000) return false;
-  infoUtcEpochAtSync = utcNow;
-  infoTimeSyncMs = millis();
-  infoTimeValid = true;
-  return true;
-}
-
-bool fetchInfoUtcOffset() {
-  if (WiFi.status() != WL_CONNECTED) return false;
-  if (!infoHasCoordinates) return false;
-
-  debugLastTimezoneCode = -1;
-  debugLastWorldTimeCode = -1;
-  debugLastTimezonePayload = "";
-  debugLastWorldTimePayload = "";
-
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient tzHttp;
-  String tzUrl = "https://api.geotimezone.com/public/timezone?latitude=" + String(infoLatitude, 4) +
-               "&longitude=" + String(infoLongitude, 4);
-  if (!tzHttp.begin(client, tzUrl)) return false;
-  debugLastTimezoneCode = tzHttp.GET();
-  if (debugLastTimezoneCode != 200) {
-    debugLastTimezonePayload = truncateForDebug(tzHttp.getString());
-    tzHttp.end();
-    return false;
-  }
-  String tzPayload = tzHttp.getString();
-  debugLastTimezonePayload = truncateForDebug(tzPayload);
-  tzHttp.end();
-
-  JsonDocument tzDoc;
-  if (deserializeJson(tzDoc, tzPayload)) return false;
-
-  String tzId;
-  if (tzDoc["iana_timezone"].is<const char*>()) {
-    tzId = tzDoc["iana_timezone"].as<String>();
-  } else if (tzDoc["timezone"].is<const char*>()) {
-    tzId = tzDoc["timezone"].as<String>();
-  } else if (tzDoc["timezone_id"].is<const char*>()) {
-    tzId = tzDoc["timezone_id"].as<String>();
-  } else if (tzDoc["olson_timezone"].is<const char*>()) {
-    tzId = tzDoc["olson_timezone"].as<String>();
-  }
-
-  if (tzId.length() > 0) {
-    infoTimezoneId = tzId;
-    HTTPClient wtHttp;
-    String wtUrl = "http://worldtimeapi.org/api/timezone/" + tzId;
-    if (wtHttp.begin(wtUrl)) {
-      debugLastWorldTimeCode = wtHttp.GET();
-      String wtPayload = wtHttp.getString();
-      debugLastWorldTimePayload = truncateForDebug(wtPayload);
-      wtHttp.end();
-
-      if (debugLastWorldTimeCode == 200) {
-        JsonDocument wtDoc;
-        if (!deserializeJson(wtDoc, wtPayload)) {
-          if (wtDoc["raw_offset"].is<long>() && wtDoc["dst_offset"].is<long>()) {
-            infoUtcOffsetSeconds = wtDoc["raw_offset"].as<long>() + wtDoc["dst_offset"].as<long>();
-            return true;
-          }
-        }
-      }
-    }
-  }
-
-  return false;
 }
 
 bool fetchInfoTemperature() {
@@ -410,15 +272,8 @@ void drawWeatherIcon(int weatherCode, int x, int y) {
 void serviceInfoData() {
   uint32_t now = millis();
 
-  uint32_t timeInterval = infoTimeValid ? kInfoTimeRefreshMs : kInfoRetryMs;
-  if ((lastInfoTimeFetchMs == 0 && !infoTimeValid) || (now - lastInfoTimeFetchMs >= timeInterval)) {
-    lastInfoTimeFetchMs = now;
-    fetchInfoUtcOffset();
-    syncNtpTime();
-  }
-
   uint32_t tempInterval = infoTempValid ? kInfoTempRefreshMs : kInfoRetryMs;
-  if ((lastInfoTempFetchMs == 0 && !infoTempValid) || (now - lastInfoTempFetchMs >= tempInterval)) {
+  if (lastInfoTempFetchMs == 0 || (now - lastInfoTempFetchMs >= tempInterval)) {
     lastInfoTempFetchMs = now;
     fetchInfoTemperature();
   }
@@ -557,20 +412,12 @@ void handleStatus() {
   doc["mode"] = displayModeToString(currentDisplayMode);
   doc["speech"] = speechText;
   doc["ip"] = currentIpAddress();
-  doc["info_time"] = currentInfoTimeString();
   doc["info_temperature"] = infoTemperature;
   doc["info_temperature_unit"] = infoTempUnitLabel();
+  doc["info_weather_code"] = infoWeatherCode;
   doc["info_latitude"] = infoLatitude;
   doc["info_longitude"] = infoLongitude;
-  doc["info_timezone_id"] = infoTimezoneId;
-  doc["info_utc_offset_seconds"] = infoUtcOffsetSeconds;
-  doc["debug_time_sync_age_sec"] = (millis() - infoTimeSyncMs) / 1000UL;
-  doc["debug_utc_epoch_at_sync"] = static_cast<long>(infoUtcEpochAtSync);
-  doc["debug_timezone_api_code"] = debugLastTimezoneCode;
-  doc["debug_worldtime_api_code"] = debugLastWorldTimeCode;
   doc["debug_weather_api_code"] = debugLastWeatherCode;
-  doc["debug_timezone_api_payload"] = debugLastTimezonePayload;
-  doc["debug_worldtime_api_payload"] = debugLastWorldTimePayload;
   doc["debug_weather_api_payload"] = debugLastWeatherPayload;
 
   JsonArray notesArr = doc["notes"].to<JsonArray>();
@@ -863,8 +710,6 @@ void handleRoot() {
   html += htmlEscape(speechText);
   html += "<br><b>Notes:</b> ";
   html += String(notesCount);
-  html += "<br><b>Info Time:</b> ";
-  html += currentInfoTimeString();
   html += "<br><b>Info Temp:</b> ";
   html += htmlEscape(infoTemperature);
   html += "<br><b>Info Temp Unit:</b> ";
@@ -873,10 +718,6 @@ void handleRoot() {
   html += String(infoLatitude, 4);
   html += ", ";
   html += String(infoLongitude, 4);
-  html += "<br><b>Timezone ID:</b> ";
-  html += htmlEscape(infoTimezoneId);
-  html += "<br><b>UTC Offset (s):</b> ";
-  html += String(infoUtcOffsetSeconds);
   html += "</p><p><a href='/'>Refresh status</a> | <a href='/status'>Raw /status JSON</a></p></div>";
 
   html += "<div class='stack'>";
@@ -954,29 +795,14 @@ void handleRoot() {
   }
   html += "</ul></div>";
 
-  html += "<div class='card'><h2>Time/Weather Debug</h2>";
-  html += "<p><b>Display Clock:</b> ";
-  html += currentInfoDisplayClock();
-  html += currentInfoMeridiem();
-  html += "<br><b>Display Time (24h):</b> ";
-  html += currentInfoTimeString();
-  html += "<br><b>UTC Epoch At Sync:</b> ";
-  html += String(static_cast<long>(infoUtcEpochAtSync));
-  html += "<br><b>Sync Age (sec):</b> ";
-  html += String((millis() - infoTimeSyncMs) / 1000UL);
-  html += "<br><b>Timezone API Code:</b> ";
-  html += String(debugLastTimezoneCode);
-  html += "<br><b>WorldTime API Code:</b> ";
-  html += String(debugLastWorldTimeCode);
+  html += "<div class='card'><h2>Weather Debug</h2>";
+  html += "<p><b>Current Temperature:</b> ";
+  html += htmlEscape(infoTemperature);
   html += "<br><b>Weather API Code:</b> ";
   html += String(debugLastWeatherCode);
+  html += "<br><b>Weather Code:</b> ";
+  html += String(infoWeatherCode);
   html += "</p>";
-  html += "<p><b>Timezone API Payload:</b><br><code>";
-  html += htmlEscape(debugLastTimezonePayload);
-  html += "</code></p>";
-  html += "<p><b>WorldTime API Payload:</b><br><code>";
-  html += htmlEscape(debugLastWorldTimePayload);
-  html += "</code></p>";
   html += "<p><b>Weather API Payload:</b><br><code>";
   html += htmlEscape(debugLastWeatherPayload);
   html += "</code></p></div>";
@@ -1062,9 +888,7 @@ void handleUiInfoSettings() {
   infoLongitude = lon;
   infoUseFahrenheit = useFahrenheit;
   infoHasCoordinates = true;
-  infoTimeValid = false;
   infoTempValid = false;
-  lastInfoTimeFetchMs = 0;
   lastInfoTempFetchMs = 0;
   serviceInfoData();
 
@@ -1356,19 +1180,7 @@ void drawFace() {
 void drawInfo() {
   display.clearBuffer();
 
-  String timeStr = currentInfoDisplayClock();
-  String meridiem = currentInfoMeridiem();
   String tempStr = infoTemperature;
-
-  display.setFont(u8g2_font_logisoso24_tf);
-  int timeW = display.getStrWidth(timeStr.c_str());
-  int timeX = (128 - timeW) / 2;
-  if (timeX < 0) timeX = 0;
-  display.drawStr(timeX, 30, timeStr.c_str());
-  display.setFont(u8g2_font_5x8_tr);
-  int meridiemX = timeX + timeW + 2;
-  if (meridiemX > 122) meridiemX = 122;
-  display.drawStr(meridiemX, 19, meridiem.c_str());
 
   display.setFont(u8g2_font_fub17_tf);
   int tempW = display.getStrWidth(tempStr.c_str());
@@ -1377,8 +1189,8 @@ void drawInfo() {
   int totalW = tempW + gap + iconW;
   int tempX = (128 - totalW) / 2;
   if (tempX < 0) tempX = 0;
-  display.drawStr(tempX, 60, tempStr.c_str());
-  drawWeatherIcon(infoWeatherCode, tempX + tempW + gap, 44);
+  display.drawStr(tempX, 42, tempStr.c_str());
+  drawWeatherIcon(infoWeatherCode, tempX + tempW + gap, 26);
 
   display.sendBuffer();
 }
@@ -1433,8 +1245,6 @@ void setup() {
 
   connectWiFi();
   speechText = currentIpAddress();
-  // First sync should block briefly so displayed time is valid and stable.
-  syncNtpTime(true);
   serviceInfoData();
   setupServer();
   scheduleBlink(millis());
@@ -1463,7 +1273,9 @@ void loop() {
 
   uint32_t now = millis();
   if (now >= nextFaceRefreshMs) {
-    nextFaceRefreshMs = now + 33;
+    uint32_t refreshMs =
+        currentDisplayMode == DisplayMode::Info ? kInfoDisplayRefreshMs : kFaceRefreshMs;
+    nextFaceRefreshMs = now + refreshMs;
     if (currentDisplayMode == DisplayMode::Info) {
       drawInfo();
     } else {
