@@ -233,15 +233,21 @@ void handleEmotionGet() {
 }
 
 void handleSpeak() {
-  JsonDocument doc;
-  if (!parseJsonBody(doc) || !doc["text"].is<const char*>()) {
-    JsonDocument error;
-    error["error"] = "Expected JSON: {\"text\":\"hello\"}";
-    sendJson(400, error);
-    return;
+  String textArg;
+  if (server.hasArg("text")) {
+    textArg = server.arg("text");
+  } else {
+    JsonDocument doc;
+    if (!parseJsonBody(doc) || !doc["text"].is<const char*>()) {
+      JsonDocument error;
+      error["error"] = "Expected text via query/form arg or JSON body: {\"text\":\"hello\"}";
+      sendJson(400, error);
+      return;
+    }
+    textArg = doc["text"].as<String>();
   }
 
-  speechText = doc["text"].as<String>();
+  speechText = textArg;
   if (speechText.length() > 40) {
     speechText = speechText.substring(0, 40);
   }
@@ -252,12 +258,18 @@ void handleSpeak() {
 }
 
 void handleNotesAdd() {
-  JsonDocument doc;
-  if (!parseJsonBody(doc) || !doc["note"].is<const char*>()) {
-    JsonDocument error;
-    error["error"] = "Expected JSON: {\"note\":\"buy milk\"}";
-    sendJson(400, error);
-    return;
+  String noteArg;
+  if (server.hasArg("note")) {
+    noteArg = server.arg("note");
+  } else {
+    JsonDocument doc;
+    if (!parseJsonBody(doc) || !doc["note"].is<const char*>()) {
+      JsonDocument error;
+      error["error"] = "Expected note via query/form arg or JSON body: {\"note\":\"buy milk\"}";
+      sendJson(400, error);
+      return;
+    }
+    noteArg = doc["note"].as<String>();
   }
 
   if (notesCount >= kMaxNotes) {
@@ -267,7 +279,7 @@ void handleNotesAdd() {
     notesCount = kMaxNotes - 1;
   }
 
-  notes[notesCount++] = doc["note"].as<String>();
+  notes[notesCount++] = noteArg;
 
   JsonDocument result;
   result["ok"] = true;
@@ -287,15 +299,23 @@ void handleNotesList() {
 }
 
 void handleRemindersAdd() {
-  JsonDocument doc;
-  if (!parseJsonBody(doc) || !doc["minutes"].is<int>() || !doc["message"].is<const char*>()) {
-    JsonDocument error;
-    error["error"] = "Expected JSON: {\"minutes\":10,\"message\":\"stand up\"}";
-    sendJson(400, error);
-    return;
+  int minutes = 0;
+  String messageArg;
+  if (server.hasArg("minutes") && server.hasArg("message")) {
+    minutes = server.arg("minutes").toInt();
+    messageArg = server.arg("message");
+  } else {
+    JsonDocument doc;
+    if (!parseJsonBody(doc) || !doc["minutes"].is<int>() || !doc["message"].is<const char*>()) {
+      JsonDocument error;
+      error["error"] = "Expected minutes/message via query/form args or JSON body";
+      sendJson(400, error);
+      return;
+    }
+    minutes = doc["minutes"].as<int>();
+    messageArg = doc["message"].as<String>();
   }
 
-  int minutes = doc["minutes"].as<int>();
   if (minutes <= 0) {
     JsonDocument error;
     error["error"] = "minutes must be > 0";
@@ -320,7 +340,7 @@ void handleRemindersAdd() {
 
   reminders[slot].active = true;
   reminders[slot].dueMs = millis() + static_cast<uint32_t>(minutes) * 60000UL;
-  reminders[slot].message = doc["message"].as<String>();
+  reminders[slot].message = messageArg;
 
   JsonDocument result;
   result["ok"] = true;
@@ -340,16 +360,242 @@ void handleClear() {
   sendJson(200, result);
 }
 
+String emotionOptionsHtml(Emotion selectedEmotion) {
+  struct Item {
+    const char* name;
+    Emotion value;
+  };
+  static const Item kItems[] = {
+      {"neutral", Emotion::Neutral},       {"happy", Emotion::Happy},
+      {"sad", Emotion::Sad},               {"sleepy", Emotion::Sleepy},
+      {"angry", Emotion::Angry},           {"surprised", Emotion::Surprised},
+      {"thinking", Emotion::Thinking},
+  };
+
+  String html;
+  for (size_t i = 0; i < sizeof(kItems) / sizeof(kItems[0]); ++i) {
+    html += "<option value='";
+    html += kItems[i].name;
+    html += "'";
+    if (kItems[i].value == selectedEmotion) {
+      html += " selected";
+    }
+    html += ">";
+    html += kItems[i].name;
+    html += "</option>";
+  }
+  return html;
+}
+
+String statusMessageFromCode(const String& code) {
+  if (code == "ok_emotion") return "Emotion updated.";
+  if (code == "ok_speak") return "Speech updated.";
+  if (code == "ok_note") return "Note added.";
+  if (code == "ok_reminder") return "Reminder added.";
+  if (code == "ok_clear") return "Cleared notes and reminders.";
+  if (code == "err_emotion") return "Invalid emotion.";
+  if (code == "err_speak") return "Speech text missing.";
+  if (code == "err_note") return "Note text missing.";
+  if (code == "err_reminder") return "Reminder needs minutes > 0 and message.";
+  if (code == "err_reminders_full") return "Reminder storage full.";
+  return "";
+}
+
+void sendUiRedirect(const char* code) {
+  String location = "/";
+  if (code != nullptr && code[0] != '\0') {
+    location += "?msg=";
+    location += code;
+  }
+  server.sendHeader("Location", location, true);
+  server.send(303, "text/plain", "See Other");
+}
+
 void handleRoot() {
-  server.send(200, "text/plain",
-              "Companion 309 API\n"
-              "GET /status\n"
-              "POST /emotion {emotion}\n"
-              "POST /speak {text}\n"
-              "GET /notes\n"
-              "POST /notes {note}\n"
-              "POST /reminders {minutes,message}\n"
-              "POST /clear\n");
+  String msg = statusMessageFromCode(server.arg("msg"));
+  String html;
+  html.reserve(7000);
+
+  html += "<!doctype html><html><head><meta charset='utf-8'>";
+  html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+  html += "<title>Companion 309</title>";
+  html += "<style>";
+  html += "body{font-family:Trebuchet MS,Segoe UI,sans-serif;background:#0c1424;color:#e9efff;margin:0;padding:16px}";
+  html += ".wrap{max-width:960px;margin:0 auto}.card{border:1px solid #2e466a;background:#12203a;border-radius:10px;padding:12px;margin-bottom:10px}";
+  html += ".row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.grid{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}";
+  html += "input,select,button{background:#0f1a2f;color:#e9efff;border:1px solid #3b5d90;border-radius:8px;padding:8px}";
+  html += "input,select{flex:1;min-width:110px}button{cursor:pointer}ul{margin:6px 0 0 18px}.muted{color:#9fb3d8}";
+  html += ".msg{padding:8px;border-radius:8px;background:#173158;border:1px solid #3b5d90;margin:8px 0}";
+  html += "a{color:#80d5ff}";
+  html += "</style></head><body><div class='wrap'>";
+  html += "<h1>Companion 309 Control Panel</h1>";
+  html += "<p class='muted'>Server-rendered controls. No browser JavaScript required.</p>";
+
+  if (msg.length() > 0) {
+    html += "<div class='msg'>";
+    html += msg;
+    html += "</div>";
+  }
+
+  html += "<div class='card'><h2>Status</h2>";
+  html += "<p><b>IP:</b> ";
+  html += currentIpAddress();
+  html += "<br><b>Emotion:</b> ";
+  html += emotionToString(currentEmotion);
+  html += "<br><b>Speech:</b> ";
+  html += speechText;
+  html += "<br><b>Notes:</b> ";
+  html += String(notesCount);
+  html += "</p><p><a href='/'>Refresh status</a> | <a href='/status'>Raw /status JSON</a></p></div>";
+
+  html += "<div class='grid'>";
+
+  html += "<div class='card'><h2>Emotion</h2><form method='post' action='/ui/emotion'><div class='row'><select name='emotion'>";
+  html += emotionOptionsHtml(currentEmotion);
+  html += "</select><button type='submit'>Set Emotion</button></div></form></div>";
+
+  html += "<div class='card'><h2>Speak</h2><form method='post' action='/ui/speak'><div class='row'>";
+  html += "<input name='text' maxlength='40' placeholder='Text for display'>";
+  html += "<button type='submit'>Send Speech</button></div></form></div>";
+
+  html += "<div class='card'><h2>Add Note</h2><form method='post' action='/ui/notes'><div class='row'>";
+  html += "<input name='note' placeholder='New note'>";
+  html += "<button type='submit'>Add Note</button></div></form></div>";
+
+  html += "<div class='card'><h2>Add Reminder</h2><form method='post' action='/ui/reminders'><div class='row'>";
+  html += "<input name='minutes' type='number' min='1' value='10' style='max-width:90px'>";
+  html += "<input name='message' placeholder='Reminder message'>";
+  html += "<button type='submit'>Add Reminder</button></div></form></div>";
+
+  html += "<div class='card'><h2>Maintenance</h2><form method='post' action='/ui/clear'>";
+  html += "<button type='submit'>Clear Notes + Reminders</button></form></div>";
+
+  html += "</div>";
+
+  html += "<div class='card'><h2>Notes</h2><ul>";
+  if (notesCount == 0) {
+    html += "<li class='muted'>No notes</li>";
+  } else {
+    for (size_t i = 0; i < notesCount; ++i) {
+      html += "<li>";
+      html += notes[i];
+      html += "</li>";
+    }
+  }
+  html += "</ul></div>";
+
+  html += "<div class='card'><h2>Reminders</h2><ul>";
+  uint32_t now = millis();
+  bool foundReminder = false;
+  for (size_t i = 0; i < kMaxReminders; ++i) {
+    if (!reminders[i].active) continue;
+    foundReminder = true;
+    uint32_t remaining = reminders[i].dueMs > now ? (reminders[i].dueMs - now) : 0;
+    html += "<li>";
+    html += reminders[i].message;
+    html += " (";
+    html += String(remaining / 1000);
+    html += "s remaining)</li>";
+  }
+  if (!foundReminder) {
+    html += "<li class='muted'>No active reminders</li>";
+  }
+  html += "</ul></div>";
+
+  html += "<div class='card'><h2>API Endpoints</h2>";
+  html += "<p class='muted'>GET /status, POST /emotion, POST /speak, GET/POST /notes, POST /reminders, POST /clear</p>";
+  html += "</div>";
+
+  html += "</div></body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleUiEmotion() {
+  if (!server.hasArg("emotion")) {
+    sendUiRedirect("err_emotion");
+    return;
+  }
+  Emotion parsed = Emotion::Neutral;
+  if (!tryParseEmotion(server.arg("emotion"), parsed)) {
+    sendUiRedirect("err_emotion");
+    return;
+  }
+  setEmotion(parsed);
+  drawFace();
+  sendUiRedirect("ok_emotion");
+}
+
+void handleUiSpeak() {
+  if (!server.hasArg("text")) {
+    sendUiRedirect("err_speak");
+    return;
+  }
+  speechText = server.arg("text");
+  if (speechText.length() == 0) {
+    sendUiRedirect("err_speak");
+    return;
+  }
+  if (speechText.length() > 40) {
+    speechText = speechText.substring(0, 40);
+  }
+  sendUiRedirect("ok_speak");
+}
+
+void handleUiNotesAdd() {
+  if (!server.hasArg("note")) {
+    sendUiRedirect("err_note");
+    return;
+  }
+  String note = server.arg("note");
+  if (note.length() == 0) {
+    sendUiRedirect("err_note");
+    return;
+  }
+  if (notesCount >= kMaxNotes) {
+    for (size_t i = 1; i < kMaxNotes; ++i) {
+      notes[i - 1] = notes[i];
+    }
+    notesCount = kMaxNotes - 1;
+  }
+  notes[notesCount++] = note;
+  sendUiRedirect("ok_note");
+}
+
+void handleUiRemindersAdd() {
+  if (!server.hasArg("minutes") || !server.hasArg("message")) {
+    sendUiRedirect("err_reminder");
+    return;
+  }
+  int minutes = server.arg("minutes").toInt();
+  String message = server.arg("message");
+  if (minutes <= 0 || message.length() == 0) {
+    sendUiRedirect("err_reminder");
+    return;
+  }
+  size_t slot = kMaxReminders;
+  for (size_t i = 0; i < kMaxReminders; ++i) {
+    if (!reminders[i].active) {
+      slot = i;
+      break;
+    }
+  }
+  if (slot == kMaxReminders) {
+    sendUiRedirect("err_reminders_full");
+    return;
+  }
+  reminders[slot].active = true;
+  reminders[slot].dueMs = millis() + static_cast<uint32_t>(minutes) * 60000UL;
+  reminders[slot].message = message;
+  sendUiRedirect("ok_reminder");
+}
+
+void handleUiClear() {
+  notesCount = 0;
+  speechText = "Cleared";
+  for (size_t i = 0; i < kMaxReminders; ++i) {
+    reminders[i].active = false;
+  }
+  sendUiRedirect("ok_clear");
 }
 
 void setupServer() {
@@ -361,6 +607,11 @@ void setupServer() {
   server.on("/notes", HTTP_POST, handleNotesAdd);
   server.on("/reminders", HTTP_POST, handleRemindersAdd);
   server.on("/clear", HTTP_POST, handleClear);
+  server.on("/ui/emotion", HTTP_POST, handleUiEmotion);
+  server.on("/ui/speak", HTTP_POST, handleUiSpeak);
+  server.on("/ui/notes", HTTP_POST, handleUiNotesAdd);
+  server.on("/ui/reminders", HTTP_POST, handleUiRemindersAdd);
+  server.on("/ui/clear", HTTP_POST, handleUiClear);
   server.begin();
 
   Serial.println("HTTP API started on port 80");

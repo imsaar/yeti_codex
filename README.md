@@ -14,6 +14,7 @@ This project builds a desktop robot companion firmware and desktop control clien
 - Notes memory (up to 8 entries)
 - Reminder scheduler (up to 8 reminders)
 - HTTP API for desktop control
+- On-device web control panel at `/`
 - AP fallback mode if Wi-Fi credentials are not available
 
 ## Wiring (ESP32-C3 mini)
@@ -74,6 +75,8 @@ If connection fails after boot, device starts an AP:
 - Robot IP in AP mode: `192.168.4.1`
 
 ## HTTP API
+
+Open `http://<device-ip>/` in a browser to use the hosted control panel for all commands.
 
 - `GET /status`
 - `POST /emotion` with JSON: `{"emotion":"happy"}`
