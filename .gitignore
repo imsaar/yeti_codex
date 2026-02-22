@@ -3,5 +3,7 @@
 __pycache__/
 *.pyc
 
+.DS_Store
+
 # Local Wi-Fi secrets (never commit)
 include/wifi_secrets.h

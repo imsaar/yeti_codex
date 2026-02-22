@@ -42,6 +42,10 @@ bool blinkClosed = false;
 
 void drawFace();
 
+String currentIpAddress() {
+  return WiFi.getMode() == WIFI_AP ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
+}
+
 String emotionToString(Emotion emotion) {
   switch (emotion) {
     case Emotion::Neutral:
@@ -166,7 +170,7 @@ void handleStatus() {
   JsonDocument doc;
   doc["emotion"] = emotionToString(currentEmotion);
   doc["speech"] = speechText;
-  doc["ip"] = WiFi.getMode() == WIFI_AP ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
+  doc["ip"] = currentIpAddress();
 
   JsonArray notesArr = doc["notes"].to<JsonArray>();
   for (size_t i = 0; i < notesCount; ++i) {
@@ -487,6 +491,7 @@ void setup() {
   }
 
   connectWiFi();
+  speechText = currentIpAddress();
   setupServer();
   scheduleBlink(millis());
   drawFace();
