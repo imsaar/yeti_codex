@@ -1,9 +1,14 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <HTTPClient.h>
 #include <U8g2lib.h>
 #include <WebServer.h>
+#include <WiFiClientSecure.h>
 #include <WiFi.h>
 #include <Wire.h>
+#include <stdlib.h>
+#include <sys/time.h>
+#include <time.h>
 
 #include "config.h"
 
@@ -16,6 +21,11 @@ enum class Emotion {
   Surprised,
   Thinking,
   Love
+};
+
+enum class DisplayMode {
+  Face,
+  Info
 };
 
 struct Reminder {
@@ -31,10 +41,38 @@ U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
 WebServer server(80);
 
 Emotion currentEmotion = Emotion::Neutral;
+DisplayMode currentDisplayMode = DisplayMode::Face;
 String speechText = "Hello";
 String notes[kMaxNotes];
 size_t notesCount = 0;
 Reminder reminders[kMaxReminders];
+
+String infoTemperature = "Loading...";
+int infoWeatherCode = -1;
+bool infoTimeValid = false;
+bool infoTempValid = false;
+bool ntpConfigured = false;
+bool infoUseFahrenheit = true;
+double infoLatitude = 47.6062;
+double infoLongitude = -122.3321;
+bool infoHasCoordinates = true;
+long infoUtcOffsetSeconds = -8L * 3600L;  // Seattle default (PST) until weather sync updates.
+String infoTimezoneId = "America/Los_Angeles";
+time_t infoUtcEpochAtSync = 0;
+uint32_t infoTimeSyncMs = 0;
+uint32_t lastInfoTimeFetchMs = 0;
+uint32_t lastInfoTempFetchMs = 0;
+
+int debugLastTimezoneCode = -1;
+int debugLastWorldTimeCode = -1;
+int debugLastWeatherCode = -1;
+String debugLastTimezonePayload = "";
+String debugLastWorldTimePayload = "";
+String debugLastWeatherPayload = "";
+
+static constexpr uint32_t kInfoTimeRefreshMs = 5UL * 60UL * 1000UL;
+static constexpr uint32_t kInfoTempRefreshMs = 10UL * 60UL * 1000UL;
+static constexpr uint32_t kInfoRetryMs = 20UL * 1000UL;
 
 uint32_t nextBlinkMs = 0;
 uint32_t blinkUntilMs = 0;
@@ -42,9 +80,348 @@ uint32_t nextFaceRefreshMs = 0;
 bool blinkClosed = false;
 
 void drawFace();
+void drawInfo();
 
 String currentIpAddress() {
   return WiFi.getMode() == WIFI_AP ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
+}
+
+String displayModeToString(DisplayMode mode) {
+  return mode == DisplayMode::Info ? "info" : "face";
+}
+
+bool tryParseDisplayMode(const String& name, DisplayMode& outMode) {
+  String value = name;
+  value.toLowerCase();
+  if (value == "face") {
+    outMode = DisplayMode::Face;
+    return true;
+  }
+  if (value == "info") {
+    outMode = DisplayMode::Info;
+    return true;
+  }
+  return false;
+}
+
+bool tryParseDoubleStrict(const String& input, double& outValue) {
+  String trimmed = input;
+  trimmed.trim();
+  if (trimmed.length() == 0) return false;
+  char* endPtr = nullptr;
+  outValue = strtod(trimmed.c_str(), &endPtr);
+  return endPtr != nullptr && *endPtr == '\0';
+}
+
+String infoTempUnitLabel() {
+  return infoUseFahrenheit ? "F" : "C";
+}
+
+String tempUnitOptionsHtml() {
+  String html;
+  html += "<option value='f'";
+  if (infoUseFahrenheit) html += " selected";
+  html += ">Fahrenheit</option>";
+  html += "<option value='c'";
+  if (!infoUseFahrenheit) html += " selected";
+  html += ">Celsius</option>";
+  return html;
+}
+
+String urlEncode(const String& input) {
+  static const char hex[] = "0123456789ABCDEF";
+  String encoded;
+  encoded.reserve(input.length() * 3);
+  for (size_t i = 0; i < input.length(); ++i) {
+    uint8_t c = static_cast<uint8_t>(input[i]);
+    bool safe = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                c == '-' || c == '_' || c == '.' || c == '~';
+    if (safe) {
+      encoded += static_cast<char>(c);
+    } else {
+      encoded += '%';
+      encoded += hex[c >> 4];
+      encoded += hex[c & 0x0F];
+    }
+  }
+  return encoded;
+}
+
+String htmlEscape(const String& input) {
+  String out;
+  out.reserve(input.length() + 8);
+  for (size_t i = 0; i < input.length(); ++i) {
+    char c = input[i];
+    if (c == '&') {
+      out += "&amp;";
+    } else if (c == '<') {
+      out += "&lt;";
+    } else if (c == '>') {
+      out += "&gt;";
+    } else if (c == '"') {
+      out += "&quot;";
+    } else if (c == '\'') {
+      out += "&#39;";
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
+String truncateForDebug(const String& input, size_t maxLen = 220) {
+  if (input.length() <= maxLen) return input;
+  return input.substring(0, maxLen) + "...";
+}
+
+bool currentInfoTm(struct tm& outTm) {
+  if (!infoTimeValid) return false;
+  uint32_t elapsed = (millis() - infoTimeSyncMs) / 1000UL;
+  time_t utcNow = infoUtcEpochAtSync + static_cast<time_t>(elapsed);
+  time_t localNow = utcNow + static_cast<time_t>(infoUtcOffsetSeconds);
+  gmtime_r(&localNow, &outTm);
+  return true;
+}
+
+String currentInfoTimeString() {
+  struct tm tmLocal;
+  if (!currentInfoTm(tmLocal)) return "--:--:--";
+  char buf[10];
+  snprintf(buf, sizeof(buf), "%02d:%02d:%02d", tmLocal.tm_hour, tmLocal.tm_min, tmLocal.tm_sec);
+  return String(buf);
+}
+
+String currentInfoDisplayClock() {
+  struct tm tmLocal;
+  if (!currentInfoTm(tmLocal)) return "--:--";
+
+  int hour24 = tmLocal.tm_hour;
+  int hour12 = hour24 % 12;
+  if (hour12 == 0) hour12 = 12;
+  char buf[6];
+  snprintf(buf, sizeof(buf), "%02d:%02d", hour12, tmLocal.tm_min);
+  return String(buf);
+}
+
+String currentInfoMeridiem() {
+  struct tm tmLocal;
+  if (!currentInfoTm(tmLocal)) return "-";
+  return tmLocal.tm_hour >= 12 ? "P" : "A";
+}
+
+bool syncNtpTime(bool waitForSync = false) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  if (!ntpConfigured) {
+    // Clear any stale RTC epoch so we only accept fresh NTP-provided time.
+    struct timeval tv = {0, 0};
+    settimeofday(&tv, nullptr);
+    configTime(0, 0, "time.nist.gov", "pool.ntp.org", "time.google.com");
+    ntpConfigured = true;
+  }
+
+  if (waitForSync) {
+    uint32_t started = millis();
+    time_t probe = time(nullptr);
+    while (probe < 1700000000 && millis() - started < 20000) {
+      delay(200);
+      probe = time(nullptr);
+    }
+  }
+
+  time_t utcNow = time(nullptr);
+  if (utcNow < 1700000000) return false;
+  infoUtcEpochAtSync = utcNow;
+  infoTimeSyncMs = millis();
+  infoTimeValid = true;
+  return true;
+}
+
+bool fetchInfoUtcOffset() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  if (!infoHasCoordinates) return false;
+
+  debugLastTimezoneCode = -1;
+  debugLastWorldTimeCode = -1;
+  debugLastTimezonePayload = "";
+  debugLastWorldTimePayload = "";
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient tzHttp;
+  String tzUrl = "https://api.geotimezone.com/public/timezone?latitude=" + String(infoLatitude, 4) +
+               "&longitude=" + String(infoLongitude, 4);
+  if (!tzHttp.begin(client, tzUrl)) return false;
+  debugLastTimezoneCode = tzHttp.GET();
+  if (debugLastTimezoneCode != 200) {
+    debugLastTimezonePayload = truncateForDebug(tzHttp.getString());
+    tzHttp.end();
+    return false;
+  }
+  String tzPayload = tzHttp.getString();
+  debugLastTimezonePayload = truncateForDebug(tzPayload);
+  tzHttp.end();
+
+  JsonDocument tzDoc;
+  if (deserializeJson(tzDoc, tzPayload)) return false;
+
+  String tzId;
+  if (tzDoc["iana_timezone"].is<const char*>()) {
+    tzId = tzDoc["iana_timezone"].as<String>();
+  } else if (tzDoc["timezone"].is<const char*>()) {
+    tzId = tzDoc["timezone"].as<String>();
+  } else if (tzDoc["timezone_id"].is<const char*>()) {
+    tzId = tzDoc["timezone_id"].as<String>();
+  } else if (tzDoc["olson_timezone"].is<const char*>()) {
+    tzId = tzDoc["olson_timezone"].as<String>();
+  }
+
+  if (tzId.length() > 0) {
+    infoTimezoneId = tzId;
+    HTTPClient wtHttp;
+    String wtUrl = "http://worldtimeapi.org/api/timezone/" + tzId;
+    if (wtHttp.begin(wtUrl)) {
+      debugLastWorldTimeCode = wtHttp.GET();
+      String wtPayload = wtHttp.getString();
+      debugLastWorldTimePayload = truncateForDebug(wtPayload);
+      wtHttp.end();
+
+      if (debugLastWorldTimeCode == 200) {
+        JsonDocument wtDoc;
+        if (!deserializeJson(wtDoc, wtPayload)) {
+          if (wtDoc["raw_offset"].is<long>() && wtDoc["dst_offset"].is<long>()) {
+            infoUtcOffsetSeconds = wtDoc["raw_offset"].as<long>() + wtDoc["dst_offset"].as<long>();
+            return true;
+          }
+        }
+      }
+    }
+  }
+
+  return false;
+}
+
+bool fetchInfoTemperature() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  if (!infoHasCoordinates) return false;
+
+  debugLastWeatherCode = -1;
+  debugLastWeatherPayload = "";
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(infoLatitude, 4) +
+               "&longitude=" + String(infoLongitude, 4) +
+               "&current=temperature_2m,weather_code&temperature_unit=" +
+               String(infoUseFahrenheit ? "fahrenheit" : "celsius");
+  if (!http.begin(client, url)) return false;
+  debugLastWeatherCode = http.GET();
+  if (debugLastWeatherCode != 200) {
+    debugLastWeatherPayload = truncateForDebug(http.getString());
+    http.end();
+    return false;
+  }
+  String payload = http.getString();
+  debugLastWeatherPayload = truncateForDebug(payload);
+  http.end();
+
+  JsonDocument doc;
+  if (deserializeJson(doc, payload)) return false;
+  if (!doc["current"]["temperature_2m"].is<float>() && !doc["current"]["temperature_2m"].is<double>()) {
+    return false;
+  }
+
+  float tempValue = doc["current"]["temperature_2m"].as<float>();
+  String unit = infoTempUnitLabel();
+  if (doc["current"]["weather_code"].is<int>()) {
+    infoWeatherCode = doc["current"]["weather_code"].as<int>();
+  } else {
+    infoWeatherCode = -1;
+  }
+
+  infoTemperature = String(tempValue, 1) + String(" ") + unit;
+  infoTempValid = true;
+  return true;
+}
+
+void drawWeatherIcon(int weatherCode, int x, int y) {
+  // Sun / clear
+  if (weatherCode == 0) {
+    display.drawCircle(x + 6, y + 6, 4);
+    display.drawLine(x + 6, y, x + 6, y - 2);
+    display.drawLine(x + 6, y + 12, x + 6, y + 14);
+    display.drawLine(x, y + 6, x - 2, y + 6);
+    display.drawLine(x + 12, y + 6, x + 14, y + 6);
+    return;
+  }
+
+  // Cloud base
+  auto drawCloud = [&](int cx, int cy) {
+    display.drawCircle(cx - 3, cy, 3);
+    display.drawCircle(cx + 2, cy - 1, 4);
+    display.drawCircle(cx + 7, cy, 3);
+    display.drawLine(cx - 6, cy + 3, cx + 10, cy + 3);
+  };
+
+  // Partly cloudy
+  if (weatherCode == 1 || weatherCode == 2) {
+    display.drawCircle(x + 3, y + 4, 3);
+    display.drawLine(x + 3, y, x + 3, y - 1);
+    drawCloud(x + 7, y + 6);
+    return;
+  }
+
+  // Cloudy / fog
+  if (weatherCode == 3 || weatherCode == 45 || weatherCode == 48) {
+    drawCloud(x + 6, y + 6);
+    if (weatherCode == 45 || weatherCode == 48) {
+      display.drawLine(x, y + 12, x + 12, y + 12);
+      display.drawLine(x + 1, y + 14, x + 13, y + 14);
+    }
+    return;
+  }
+
+  // Snow
+  if ((weatherCode >= 71 && weatherCode <= 77) || weatherCode == 85 || weatherCode == 86) {
+    drawCloud(x + 6, y + 5);
+    display.drawLine(x + 4, y + 11, x + 4, y + 15);
+    display.drawLine(x + 2, y + 13, x + 6, y + 13);
+    display.drawLine(x + 9, y + 11, x + 9, y + 15);
+    display.drawLine(x + 7, y + 13, x + 11, y + 13);
+    return;
+  }
+
+  // Thunderstorm
+  if (weatherCode >= 95) {
+    drawCloud(x + 6, y + 5);
+    display.drawLine(x + 7, y + 10, x + 4, y + 14);
+    display.drawLine(x + 4, y + 14, x + 8, y + 14);
+    display.drawLine(x + 8, y + 14, x + 5, y + 18);
+    return;
+  }
+
+  // Rain / drizzle / showers (default wet icon)
+  drawCloud(x + 6, y + 5);
+  display.drawLine(x + 4, y + 11, x + 3, y + 15);
+  display.drawLine(x + 8, y + 11, x + 7, y + 15);
+  display.drawLine(x + 12, y + 11, x + 11, y + 15);
+}
+
+void serviceInfoData() {
+  uint32_t now = millis();
+
+  uint32_t timeInterval = infoTimeValid ? kInfoTimeRefreshMs : kInfoRetryMs;
+  if ((lastInfoTimeFetchMs == 0 && !infoTimeValid) || (now - lastInfoTimeFetchMs >= timeInterval)) {
+    lastInfoTimeFetchMs = now;
+    fetchInfoUtcOffset();
+    syncNtpTime();
+  }
+
+  uint32_t tempInterval = infoTempValid ? kInfoTempRefreshMs : kInfoRetryMs;
+  if ((lastInfoTempFetchMs == 0 && !infoTempValid) || (now - lastInfoTempFetchMs >= tempInterval)) {
+    lastInfoTempFetchMs = now;
+    fetchInfoTemperature();
+  }
 }
 
 String emotionToString(Emotion emotion) {
@@ -154,7 +531,7 @@ void connectWiFi() {
   Serial.println();
   Serial.println("WiFi connect timeout, starting local AP.");
   WiFi.mode(WIFI_AP);
-  WiFi.softAP("Companion-309", "companion309");
+  WiFi.softAP("Companion-313", "companion313");
   Serial.print("AP IP: ");
   Serial.println(WiFi.softAPIP());
 }
@@ -177,8 +554,24 @@ bool parseJsonBody(JsonDocument& doc) {
 void handleStatus() {
   JsonDocument doc;
   doc["emotion"] = emotionToString(currentEmotion);
+  doc["mode"] = displayModeToString(currentDisplayMode);
   doc["speech"] = speechText;
   doc["ip"] = currentIpAddress();
+  doc["info_time"] = currentInfoTimeString();
+  doc["info_temperature"] = infoTemperature;
+  doc["info_temperature_unit"] = infoTempUnitLabel();
+  doc["info_latitude"] = infoLatitude;
+  doc["info_longitude"] = infoLongitude;
+  doc["info_timezone_id"] = infoTimezoneId;
+  doc["info_utc_offset_seconds"] = infoUtcOffsetSeconds;
+  doc["debug_time_sync_age_sec"] = (millis() - infoTimeSyncMs) / 1000UL;
+  doc["debug_utc_epoch_at_sync"] = static_cast<long>(infoUtcEpochAtSync);
+  doc["debug_timezone_api_code"] = debugLastTimezoneCode;
+  doc["debug_worldtime_api_code"] = debugLastWorldTimeCode;
+  doc["debug_weather_api_code"] = debugLastWeatherCode;
+  doc["debug_timezone_api_payload"] = debugLastTimezonePayload;
+  doc["debug_worldtime_api_payload"] = debugLastWorldTimePayload;
+  doc["debug_weather_api_payload"] = debugLastWeatherPayload;
 
   JsonArray notesArr = doc["notes"].to<JsonArray>();
   for (size_t i = 0; i < notesCount; ++i) {
@@ -395,17 +788,32 @@ String emotionOptionsHtml(Emotion selectedEmotion) {
   return html;
 }
 
+String modeOptionsHtml(DisplayMode selectedMode) {
+  String html;
+  html += "<option value='face'";
+  if (selectedMode == DisplayMode::Face) html += " selected";
+  html += ">face</option>";
+  html += "<option value='info'";
+  if (selectedMode == DisplayMode::Info) html += " selected";
+  html += ">info</option>";
+  return html;
+}
+
 String statusMessageFromCode(const String& code) {
   if (code == "ok_emotion") return "Emotion updated.";
   if (code == "ok_speak") return "Speech updated.";
   if (code == "ok_note") return "Note added.";
   if (code == "ok_reminder") return "Reminder added.";
   if (code == "ok_clear") return "Cleared notes and reminders.";
+  if (code == "ok_mode") return "Display mode updated.";
+  if (code == "ok_info") return "Info settings updated.";
   if (code == "err_emotion") return "Invalid emotion.";
   if (code == "err_speak") return "Speech text missing.";
   if (code == "err_note") return "Note text missing.";
   if (code == "err_reminder") return "Reminder needs minutes > 0 and message.";
   if (code == "err_reminders_full") return "Reminder storage full.";
+  if (code == "err_mode") return "Invalid mode. Use face or info.";
+  if (code == "err_info") return "Latitude/longitude required and must be valid.";
   return "";
 }
 
@@ -422,22 +830,24 @@ void sendUiRedirect(const char* code) {
 void handleRoot() {
   String msg = statusMessageFromCode(server.arg("msg"));
   String html;
-  html.reserve(7000);
+  html.reserve(8500);
 
   html += "<!doctype html><html><head><meta charset='utf-8'>";
   html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
-  html += "<title>Companion 309</title>";
+  html += "<title>Companion 313</title>";
   html += "<style>";
   html += "body{font-family:Trebuchet MS,Segoe UI,sans-serif;background:#0c1424;color:#e9efff;margin:0;padding:16px}";
   html += ".wrap{max-width:960px;margin:0 auto}.card{border:1px solid #2e466a;background:#12203a;border-radius:10px;padding:12px;margin-bottom:10px}";
   html += ".row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.grid{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}";
+  html += ".topgrid{display:grid;gap:10px;grid-template-columns:1fr 1fr 1fr;margin-bottom:10px}.stack{display:grid;gap:10px}";
   html += "input,select,button{background:#0f1a2f;color:#e9efff;border:1px solid #3b5d90;border-radius:8px;padding:8px}";
   html += "input,select{flex:1;min-width:110px}button{cursor:pointer}ul{margin:6px 0 0 18px}.muted{color:#9fb3d8}";
   html += ".msg{padding:8px;border-radius:8px;background:#173158;border:1px solid #3b5d90;margin:8px 0}";
+  html += "code{display:block;white-space:pre-wrap;word-break:break-word;background:#0b1528;padding:6px;border-radius:6px}";
+  html += "@media (max-width:800px){.topgrid{grid-template-columns:1fr}}";
   html += "a{color:#80d5ff}";
   html += "</style></head><body><div class='wrap'>";
-  html += "<h1>Companion 309 Control Panel</h1>";
-  html += "<p class='muted'>Server-rendered controls. No browser JavaScript required.</p>";
+  html += "<h1>Companion 313 Control Panel</h1>";
 
   if (msg.length() > 0) {
     html += "<div class='msg'>";
@@ -445,26 +855,60 @@ void handleRoot() {
     html += "</div>";
   }
 
+  html += "<div class='topgrid'>";
   html += "<div class='card'><h2>Status</h2>";
   html += "<p><b>IP:</b> ";
   html += currentIpAddress();
-  html += "<br><b>Emotion:</b> ";
-  html += emotionToString(currentEmotion);
   html += "<br><b>Speech:</b> ";
-  html += speechText;
+  html += htmlEscape(speechText);
   html += "<br><b>Notes:</b> ";
   html += String(notesCount);
+  html += "<br><b>Info Time:</b> ";
+  html += currentInfoTimeString();
+  html += "<br><b>Info Temp:</b> ";
+  html += htmlEscape(infoTemperature);
+  html += "<br><b>Info Temp Unit:</b> ";
+  html += infoTempUnitLabel();
+  html += "<br><b>Info Lat/Lon:</b> ";
+  html += String(infoLatitude, 4);
+  html += ", ";
+  html += String(infoLongitude, 4);
+  html += "<br><b>Timezone ID:</b> ";
+  html += htmlEscape(infoTimezoneId);
+  html += "<br><b>UTC Offset (s):</b> ";
+  html += String(infoUtcOffsetSeconds);
   html += "</p><p><a href='/'>Refresh status</a> | <a href='/status'>Raw /status JSON</a></p></div>";
 
-  html += "<div class='grid'>";
-
-  html += "<div class='card'><h2>Emotion</h2><form method='post' action='/ui/emotion'><div class='row'><select name='emotion'>";
-  html += emotionOptionsHtml(currentEmotion);
-  html += "</select><button type='submit'>Set Emotion</button></div></form></div>";
+  html += "<div class='stack'>";
+  html += "<div class='card'><h2>Info Settings</h2><form method='post' action='/ui/info'><div class='row'>";
+  html += "<input name='latitude' value='";
+  html += String(infoLatitude, 6);
+  html += "' placeholder='Latitude (e.g. 47.6062)'>";
+  html += "</div><div class='row'>";
+  html += "<input name='longitude' value='";
+  html += String(infoLongitude, 6);
+  html += "' placeholder='Longitude (e.g. -122.3321)'>";
+  html += "</div><div class='row'><select name='temperature_unit'>";
+  html += tempUnitOptionsHtml();
+  html += "</select><button type='submit'>Save Coords</button></div></form></div>";
 
   html += "<div class='card'><h2>Speak</h2><form method='post' action='/ui/speak'><div class='row'>";
   html += "<input name='text' maxlength='40' placeholder='Text for display'>";
   html += "<button type='submit'>Send Speech</button></div></form></div>";
+  html += "</div>";
+
+  html += "<div class='stack'>";
+  html += "<div class='card'><h2>Display Mode</h2><form method='post' action='/ui/mode'><div class='row'><select name='mode'>";
+  html += modeOptionsHtml(currentDisplayMode);
+  html += "</select><button type='submit'>Set Mode</button></div></form></div>";
+
+  html += "<div class='card'><h2>Emotion</h2><form method='post' action='/ui/emotion'><div class='row'><select name='emotion'>";
+  html += emotionOptionsHtml(currentEmotion);
+  html += "</select><button type='submit'>Set Emotion</button></div></form></div>";
+  html += "</div>";
+  html += "</div>";
+
+  html += "<div class='grid'>";
 
   html += "<div class='card'><h2>Add Note</h2><form method='post' action='/ui/notes'><div class='row'>";
   html += "<input name='note' placeholder='New note'>";
@@ -486,7 +930,7 @@ void handleRoot() {
   } else {
     for (size_t i = 0; i < notesCount; ++i) {
       html += "<li>";
-      html += notes[i];
+      html += htmlEscape(notes[i]);
       html += "</li>";
     }
   }
@@ -500,7 +944,7 @@ void handleRoot() {
     foundReminder = true;
     uint32_t remaining = reminders[i].dueMs > now ? (reminders[i].dueMs - now) : 0;
     html += "<li>";
-    html += reminders[i].message;
+    html += htmlEscape(reminders[i].message);
     html += " (";
     html += String(remaining / 1000);
     html += "s remaining)</li>";
@@ -510,8 +954,35 @@ void handleRoot() {
   }
   html += "</ul></div>";
 
+  html += "<div class='card'><h2>Time/Weather Debug</h2>";
+  html += "<p><b>Display Clock:</b> ";
+  html += currentInfoDisplayClock();
+  html += currentInfoMeridiem();
+  html += "<br><b>Display Time (24h):</b> ";
+  html += currentInfoTimeString();
+  html += "<br><b>UTC Epoch At Sync:</b> ";
+  html += String(static_cast<long>(infoUtcEpochAtSync));
+  html += "<br><b>Sync Age (sec):</b> ";
+  html += String((millis() - infoTimeSyncMs) / 1000UL);
+  html += "<br><b>Timezone API Code:</b> ";
+  html += String(debugLastTimezoneCode);
+  html += "<br><b>WorldTime API Code:</b> ";
+  html += String(debugLastWorldTimeCode);
+  html += "<br><b>Weather API Code:</b> ";
+  html += String(debugLastWeatherCode);
+  html += "</p>";
+  html += "<p><b>Timezone API Payload:</b><br><code>";
+  html += htmlEscape(debugLastTimezonePayload);
+  html += "</code></p>";
+  html += "<p><b>WorldTime API Payload:</b><br><code>";
+  html += htmlEscape(debugLastWorldTimePayload);
+  html += "</code></p>";
+  html += "<p><b>Weather API Payload:</b><br><code>";
+  html += htmlEscape(debugLastWeatherPayload);
+  html += "</code></p></div>";
+
   html += "<div class='card'><h2>API Endpoints</h2>";
-  html += "<p class='muted'>GET /status, POST /emotion, POST /speak, GET/POST /notes, POST /reminders, POST /clear</p>";
+  html += "<p class='muted'>GET /status, POST /emotion, POST /speak, GET/POST /notes, POST /reminders, POST /clear, POST /ui/mode, POST /ui/info</p>";
   html += "</div>";
 
   html += "</div></body></html>";
@@ -531,6 +1002,73 @@ void handleUiEmotion() {
   setEmotion(parsed);
   drawFace();
   sendUiRedirect("ok_emotion");
+}
+
+void handleUiMode() {
+  if (!server.hasArg("mode")) {
+    sendUiRedirect("err_mode");
+    return;
+  }
+  DisplayMode parsed = DisplayMode::Face;
+  if (!tryParseDisplayMode(server.arg("mode"), parsed)) {
+    sendUiRedirect("err_mode");
+    return;
+  }
+  currentDisplayMode = parsed;
+  sendUiRedirect("ok_mode");
+}
+
+void handleUiInfoSettings() {
+  if (!server.hasArg("latitude") || !server.hasArg("longitude")) {
+    sendUiRedirect("err_info");
+    return;
+  }
+  String latStr = server.arg("latitude");
+  String lonStr = server.arg("longitude");
+  latStr.trim();
+  lonStr.trim();
+  if (latStr.length() == 0 || lonStr.length() == 0) {
+    sendUiRedirect("err_info");
+    return;
+  }
+
+  double lat = 0.0;
+  double lon = 0.0;
+  if (!tryParseDoubleStrict(latStr, lat) || !tryParseDoubleStrict(lonStr, lon)) {
+    sendUiRedirect("err_info");
+    return;
+  }
+  if (lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0) {
+    sendUiRedirect("err_info");
+    return;
+  }
+
+  bool useFahrenheit = infoUseFahrenheit;
+  if (server.hasArg("temperature_unit")) {
+    String unit = server.arg("temperature_unit");
+    unit.trim();
+    unit.toLowerCase();
+    if (unit == "f") {
+      useFahrenheit = true;
+    } else if (unit == "c") {
+      useFahrenheit = false;
+    } else {
+      sendUiRedirect("err_info");
+      return;
+    }
+  }
+
+  infoLatitude = lat;
+  infoLongitude = lon;
+  infoUseFahrenheit = useFahrenheit;
+  infoHasCoordinates = true;
+  infoTimeValid = false;
+  infoTempValid = false;
+  lastInfoTimeFetchMs = 0;
+  lastInfoTempFetchMs = 0;
+  serviceInfoData();
+
+  sendUiRedirect("ok_info");
 }
 
 void handleUiSpeak() {
@@ -615,6 +1153,8 @@ void setupServer() {
   server.on("/notes", HTTP_POST, handleNotesAdd);
   server.on("/reminders", HTTP_POST, handleRemindersAdd);
   server.on("/clear", HTTP_POST, handleClear);
+  server.on("/ui/mode", HTTP_POST, handleUiMode);
+  server.on("/ui/info", HTTP_POST, handleUiInfoSettings);
   server.on("/ui/emotion", HTTP_POST, handleUiEmotion);
   server.on("/ui/speak", HTTP_POST, handleUiSpeak);
   server.on("/ui/notes", HTTP_POST, handleUiNotesAdd);
@@ -813,6 +1353,36 @@ void drawFace() {
   display.sendBuffer();
 }
 
+void drawInfo() {
+  display.clearBuffer();
+
+  String timeStr = currentInfoDisplayClock();
+  String meridiem = currentInfoMeridiem();
+  String tempStr = infoTemperature;
+
+  display.setFont(u8g2_font_logisoso24_tf);
+  int timeW = display.getStrWidth(timeStr.c_str());
+  int timeX = (128 - timeW) / 2;
+  if (timeX < 0) timeX = 0;
+  display.drawStr(timeX, 30, timeStr.c_str());
+  display.setFont(u8g2_font_5x8_tr);
+  int meridiemX = timeX + timeW + 2;
+  if (meridiemX > 122) meridiemX = 122;
+  display.drawStr(meridiemX, 19, meridiem.c_str());
+
+  display.setFont(u8g2_font_fub17_tf);
+  int tempW = display.getStrWidth(tempStr.c_str());
+  const int iconW = 16;
+  const int gap = 4;
+  int totalW = tempW + gap + iconW;
+  int tempX = (128 - totalW) / 2;
+  if (tempX < 0) tempX = 0;
+  display.drawStr(tempX, 60, tempStr.c_str());
+  drawWeatherIcon(infoWeatherCode, tempX + tempW + gap, 44);
+
+  display.sendBuffer();
+}
+
 void serviceBlink() {
   uint32_t now = millis();
 
@@ -863,15 +1433,23 @@ void setup() {
 
   connectWiFi();
   speechText = currentIpAddress();
+  // First sync should block briefly so displayed time is valid and stable.
+  syncNtpTime(true);
+  serviceInfoData();
   setupServer();
   scheduleBlink(millis());
-  drawFace();
+  if (currentDisplayMode == DisplayMode::Info) {
+    drawInfo();
+  } else {
+    drawFace();
+  }
 }
 
 void loop() {
   server.handleClient();
   serviceBlink();
   serviceReminders();
+  serviceInfoData();
 
 #if EMOTION_BUTTON_PIN >= 0
   static bool prevPressed = false;
@@ -886,6 +1464,10 @@ void loop() {
   uint32_t now = millis();
   if (now >= nextFaceRefreshMs) {
     nextFaceRefreshMs = now + 33;
-    drawFace();
+    if (currentDisplayMode == DisplayMode::Info) {
+      drawInfo();
+    } else {
+      drawFace();
+    }
   }
 }

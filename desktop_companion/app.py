@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Desktop controller for Companion 309 firmware."""
+"""Desktop controller for Companion 313 firmware."""
 
 from __future__ import annotations
 

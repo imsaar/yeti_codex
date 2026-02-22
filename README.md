@@ -1,4 +1,4 @@
-# Companion 309 (ESP32-C3 mini + 0.96 OLED)
+# Companion 313 (ESP32-C3 mini + 0.96 OLED)
 
 This project builds a desktop robot companion firmware and desktop control client using:
 
@@ -70,8 +70,8 @@ cp include/wifi_secrets.example.h include/wifi_secrets.h
 
 If connection fails after boot, device starts an AP:
 
-- SSID: `Companion-309`
-- Password: `companion309`
+- SSID: `Companion-313`
+- Password: `companion313`
 - Robot IP in AP mode: `192.168.4.1`
 
 ## HTTP API
