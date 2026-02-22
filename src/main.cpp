@@ -14,7 +14,8 @@ enum class Emotion {
   Sleepy,
   Angry,
   Surprised,
-  Thinking
+  Thinking,
+  Love
 };
 
 struct Reminder {
@@ -62,6 +63,8 @@ String emotionToString(Emotion emotion) {
       return "surprised";
     case Emotion::Thinking:
       return "thinking";
+    case Emotion::Love:
+      return "love";
   }
   return "neutral";
 }
@@ -76,6 +79,7 @@ Emotion parseEmotion(const String& name) {
   if (value == "angry") return Emotion::Angry;
   if (value == "surprised") return Emotion::Surprised;
   if (value == "thinking") return Emotion::Thinking;
+  if (value == "love") return Emotion::Love;
   return Emotion::Neutral;
 }
 
@@ -109,6 +113,10 @@ bool tryParseEmotion(const String& name, Emotion& outEmotion) {
   }
   if (value == "thinking") {
     outEmotion = Emotion::Thinking;
+    return true;
+  }
+  if (value == "love") {
+    outEmotion = Emotion::Love;
     return true;
   }
   return false;
@@ -212,7 +220,7 @@ void handleEmotion() {
     JsonDocument error;
     error["error"] = "Invalid emotion";
     error["received"] = emotionArg;
-    error["allowed"] = "neutral,happy,sad,sleepy,angry,surprised,thinking";
+    error["allowed"] = "neutral,happy,sad,sleepy,angry,surprised,thinking,love";
     sendJson(400, error);
     return;
   }
@@ -369,7 +377,7 @@ String emotionOptionsHtml(Emotion selectedEmotion) {
       {"neutral", Emotion::Neutral},       {"happy", Emotion::Happy},
       {"sad", Emotion::Sad},               {"sleepy", Emotion::Sleepy},
       {"angry", Emotion::Angry},           {"surprised", Emotion::Surprised},
-      {"thinking", Emotion::Thinking},
+      {"thinking", Emotion::Thinking},     {"love", Emotion::Love},
   };
 
   String html;
@@ -685,78 +693,117 @@ void drawCheeks() {
   display.drawDisc(102, 44, 1);
 }
 
+void drawThoughtBubble(int wobble) {
+  int baseY = 49 - wobble;
+  display.drawDisc(54, baseY - 5, 1);
+  display.drawDisc(61, baseY - 3, 2);
+  display.drawDisc(71, baseY, 3);
+  display.drawCircle(82, baseY + 2, 5);
+  display.drawCircle(89, baseY + 1, 4);
+  display.drawCircle(94, baseY + 3, 3);
+}
+
+void drawSleepZ(int phase) {
+  int y = 10 + phase;
+  display.setFont(u8g2_font_5x8_tr);
+  display.drawStr(95, y, "Z");
+  display.drawStr(104, y + 4, "z");
+  display.drawStr(111, y + 8, "z");
+}
+
+void drawHeart(int cx, int cy, int r) {
+  display.drawDisc(cx - r / 2, cy - r / 2, r / 2 + 1);
+  display.drawDisc(cx + r / 2, cy - r / 2, r / 2 + 1);
+  display.drawTriangle(cx - r - 1, cy - r / 3, cx + r + 1, cy - r / 3, cx, cy + r + 1);
+}
+
 void drawFace() {
   display.clearBuffer();
 
   bool closed = blinkClosed || currentEmotion == Emotion::Sleepy;
   uint32_t now = millis();
   int glance = static_cast<int>((now / 400UL) % 3UL) - 1;  // -1, 0, 1 subtle scanning look
+  int pulse2 = static_cast<int>((now / 220UL) % 2UL);      // 0/1
+  int pulse3 = static_cast<int>((now / 260UL) % 3UL) - 1;  // -1/0/1
+  int bob = static_cast<int>((now / 300UL) % 4UL);         // 0..3
+  int bobY = (bob < 2) ? bob : (3 - bob);                  // 0,1,1,0
 
   switch (currentEmotion) {
     case Emotion::Happy:
-      drawEyes(15, 15, 5, closed);
+      drawEyes(15 + bobY, 15, 5, closed);
       if (!closed) {
-        drawPupils(15, 15, glance);
+        drawPupils(15 + bobY, 15, glance);
       }
-      drawBrows(30, 12, 48, 10, 78, 10, 96, 12);
+      drawBrows(30, 12 + bobY, 48, 10 + bobY, 78, 10 + bobY, 96, 12 + bobY);
       drawCheeks();
-      drawMouthSmile(41, 26);
+      drawMouthSmile(41 + pulse2, 26);
       break;
     case Emotion::Sad:
-      drawEyes(18, 10, 4, closed);
+      drawEyes(18 + pulse2, 10, 4, closed);
       if (!closed) {
-        drawPupils(18, 10, 0);
+        drawPupils(18 + pulse2, 10, 0);
       }
-      drawBrows(28, 11, 48, 16, 80, 16, 100, 11);
-      drawMouthFrown(43, 24);
-      display.drawPixel(25, 36);
-      display.drawPixel(103, 36);
+      drawBrows(28, 11 + pulse2, 48, 16 + pulse2, 80, 16 + pulse2, 100, 11 + pulse2);
+      drawMouthFrown(43 + pulse2, 24);
+      display.drawPixel(25, 36 + (pulse2 * 2));
+      display.drawPixel(103, 36 + ((1 - pulse2) * 2));
       break;
     case Emotion::Sleepy:
-      drawEyes(24, 4, 2, true);
-      display.drawLine(30, 20, 50, 20);
-      display.drawLine(78, 20, 98, 20);
-      drawMouthFlat(46, 14);
-      display.drawPixel(64, 50);
+      drawEyes(24 + pulse2, 4, 2, true);
+      display.drawLine(30, 20 + pulse2, 50, 20 + pulse2);
+      display.drawLine(78, 20 + pulse2, 98, 20 + pulse2);
+      drawMouthFlat(46 + pulse2, 14);
+      display.drawPixel(63 + pulse2, 50);
+      drawSleepZ(pulse2);
       break;
     case Emotion::Angry:
-      drawEyes(18, 12, 2, closed);
+      drawEyes(18, 12 + pulse2, 2, closed);
       if (!closed) {
-        drawPupils(18, 12, 0);
+        drawPupils(18, 12 + pulse2, pulse3);
       }
-      drawBrows(25, 14, 49, 9, 103, 14, 79, 9);
-      drawMouthFlat(44, 22);
-      display.drawLine(52, 47, 76, 47);
-      display.drawLine(52, 48, 76, 48);
+      drawBrows(25, 14 - pulse2, 49, 9 - pulse2, 103, 14 - pulse2, 79, 9 - pulse2);
+      drawMouthFlat(44, 22 + pulse2);
+      display.drawLine(52, 47 + pulse2, 76, 47 + pulse2);
+      display.drawLine(52, 48 + pulse2, 76, 48 + pulse2);
       break;
     case Emotion::Surprised:
-      drawEyes(14, 18, 9, closed);
+      drawEyes(14, 18 + pulse2, 9, closed);
       if (!closed) {
-        drawPupils(14, 18, 0);
+        drawPupils(14, 18 + pulse2, 0);
       }
-      drawBrows(30, 10, 48, 9, 78, 9, 96, 10);
-      drawMouthOpen(64, 45, 6);
+      drawBrows(30, 10 - pulse2, 48, 9 - pulse2, 78, 9 - pulse2, 96, 10 - pulse2);
+      drawMouthOpen(64, 45, 5 + pulse2);
       break;
     case Emotion::Thinking:
       drawEyes(17, 11, 4, closed);
       if (!closed) {
-        drawPupils(17, 11, -1);
+        drawPupils(17, 11, -1 + pulse2);
       }
-      drawBrows(29, 12, 47, 11, 78, 12, 97, 14);
+      drawBrows(29, 12, 47, 11 + pulse2, 78, 12, 97, 14 + pulse2);
       drawMouthFlat(44, 14);
-      display.drawDisc(54, 43, 1);
-      display.drawDisc(61, 45, 2);
-      display.drawDisc(71, 48, 3);
-      display.drawCircle(80, 50, 4);
+      drawThoughtBubble(pulse2);
       break;
+    case Emotion::Love: {
+      int heartPulse = 5 + pulse2;
+      if (closed) {
+        drawEyes(18, 10, 3, true);
+      } else {
+        drawHeart(40, 24 + bobY, heartPulse);
+        drawHeart(88, 24 + bobY, heartPulse);
+      }
+      drawBrows(30, 12 + bobY, 48, 11 + bobY, 78, 11 + bobY, 96, 12 + bobY);
+      drawCheeks();
+      drawMouthSmile(41 + pulse2, 28);
+      break;
+    }
     case Emotion::Neutral:
     default:
-      drawEyes(17, 12, 5, closed);
+      drawEyes(17 + (bobY ? 1 : 0), 12, 5, closed);
       if (!closed) {
-        drawPupils(17, 12, 0);
+        drawPupils(17 + (bobY ? 1 : 0), 12, pulse3);
       }
-      drawBrows(30, 12, 48, 12, 78, 12, 96, 12);
-      drawMouthFlat(44, 18);
+      drawBrows(30, 12, 48, 12 + (bobY ? 1 : 0), 78, 12, 96, 12 + (bobY ? 1 : 0));
+      drawMouthFlat(44 + (bobY ? 1 : 0), 18);
       break;
   }
 
@@ -830,7 +877,7 @@ void loop() {
   static bool prevPressed = false;
   bool pressed = digitalRead(EMOTION_BUTTON_PIN) == LOW;
   if (pressed && !prevPressed) {
-    int next = (static_cast<int>(currentEmotion) + 1) % 7;
+    int next = (static_cast<int>(currentEmotion) + 1) % 8;
     setEmotion(static_cast<Emotion>(next));
   }
   prevPressed = pressed;
