@@ -82,6 +82,30 @@ void drawWeatherIcon(int weatherCode, int x, int y) {
   display.drawLine(x + 12, y + 11, x + 11, y + 15);
 }
 
+void drawSunIcon(int x, int y) {
+  int cx = x + 5;
+  int cy = y + 5;
+  display.drawCircle(cx, cy, 3);
+  display.drawLine(cx, cy - 5, cx, cy - 3);
+  display.drawLine(cx, cy + 3, cx, cy + 5);
+  display.drawLine(cx - 5, cy, cx - 3, cy);
+  display.drawLine(cx + 3, cy, cx + 5, cy);
+  display.drawPixel(cx - 3, cy - 3);
+  display.drawPixel(cx + 3, cy - 3);
+  display.drawPixel(cx - 3, cy + 3);
+  display.drawPixel(cx + 3, cy + 3);
+}
+
+void drawMoonIcon(int x, int y) {
+  int cx = x + 5;
+  int cy = y + 5;
+  display.drawDisc(cx, cy, 4);
+  display.setDrawColor(0);
+  display.drawDisc(cx + 2, cy - 1, 4);
+  display.setDrawColor(1);
+  display.drawCircle(cx, cy, 4);
+}
+
 void drawEyes(int y, int h, int curve, bool closed) {
   const int leftX = 30;
   const int rightX = 78;
@@ -273,14 +297,39 @@ void drawFace() {
 void drawInfo() {
   display.clearBuffer();
 
-  display.setFont(u8g2_font_fub17_tf);
+  display.setFont(u8g2_font_fub20_tf);
 
   // Local time at top
   String timeStr = getLocalTimeString();
+  bool hasMeridiem = false;
+  bool isPm = false;
+  if (timeStr.length() > 0) {
+    char suffix = timeStr.charAt(timeStr.length() - 1);
+    if (suffix == 'A' || suffix == 'P') {
+      hasMeridiem = true;
+      isPm = suffix == 'P';
+      timeStr.remove(timeStr.length() - 1);
+    }
+  }
   int timeW = display.getStrWidth(timeStr.c_str());
-  display.drawStr((128 - timeW) / 2, 22, timeStr.c_str());
+  const int meridiemIconW = 10;
+  const int meridiemGap = 3;
+  int totalTimeW = timeW + (hasMeridiem ? (meridiemGap + meridiemIconW) : 0);
+  int timeX = (128 - totalTimeW) / 2;
+  if (timeX < 0) timeX = 0;
+  display.drawStr(timeX, 24, timeStr.c_str());
+  if (hasMeridiem) {
+    int iconX = timeX + timeW + meridiemGap;
+    int iconY = 10;
+    if (isPm) {
+      drawMoonIcon(iconX, iconY);
+    } else {
+      drawSunIcon(iconX, iconY);
+    }
+  }
 
   // Temperature + weather icon centered below
+  display.setFont(u8g2_font_fub14_tf);
   String tempStr = infoTemperature;
   int tempW = display.getStrWidth(tempStr.c_str());
   const int iconW = 16;
@@ -288,8 +337,8 @@ void drawInfo() {
   int totalW = tempW + gap + iconW;
   int tempX = (128 - totalW) / 2;
   if (tempX < 0) tempX = 0;
-  display.drawStr(tempX, 52, tempStr.c_str());
-  drawWeatherIcon(infoWeatherCode, tempX + tempW + gap, 36);
+  display.drawStr(tempX, 54, tempStr.c_str());
+  drawWeatherIcon(infoWeatherCode, tempX + tempW + gap, 39);
 
   display.sendBuffer();
 }
