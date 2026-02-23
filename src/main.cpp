@@ -7,6 +7,7 @@
 #include <WiFi.h>
 #include <Wire.h>
 #include <stdlib.h>
+#include "esp_sntp.h"
 
 #include "config.h"
 
@@ -53,6 +54,13 @@ double infoLatitude = 47.6062;
 double infoLongitude = -122.3321;
 bool infoHasCoordinates = true;
 uint32_t lastInfoTempFetchMs = 0;
+long infoUtcOffsetSeconds = 0;
+String infoTimezoneAbbr = "";
+bool infoTimeValid = false;
+bool ntpSynced = false;
+volatile bool sntpCallbackFired = false;
+volatile uint32_t sntpEpochAtSync = 0;   // UTC epoch at last sync (uint32_t = atomic read on ESP32, valid until 2106)
+volatile uint32_t sntpMillisAtSync = 0;  // millis() captured at same instant
 
 int debugLastWeatherCode = -1;
 String debugLastWeatherPayload = "";
@@ -175,7 +183,8 @@ bool fetchInfoTemperature() {
   String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(infoLatitude, 4) +
                "&longitude=" + String(infoLongitude, 4) +
                "&current=temperature_2m,weather_code&temperature_unit=" +
-               String(infoUseFahrenheit ? "fahrenheit" : "celsius");
+               String(infoUseFahrenheit ? "fahrenheit" : "celsius") +
+               "&timezone=auto";
   if (!http.begin(client, url)) return false;
   debugLastWeatherCode = http.GET();
   if (debugLastWeatherCode != 200) {
@@ -199,6 +208,18 @@ bool fetchInfoTemperature() {
     infoWeatherCode = doc["current"]["weather_code"].as<int>();
   } else {
     infoWeatherCode = -1;
+  }
+
+  if (!doc["utc_offset_seconds"].isNull()) {
+    long offset = doc["utc_offset_seconds"].as<long>();
+    if (offset >= -50400L && offset <= 50400L) {  // valid UTC-14 to UTC+14
+      infoUtcOffsetSeconds = offset;
+      infoTimeValid = true;
+      Serial.printf("UTC offset set: %ld s\n", offset);
+    }
+  }
+  if (!doc["timezone_abbreviation"].isNull()) {
+    infoTimezoneAbbr = doc["timezone_abbreviation"].as<String>();
   }
 
   infoTemperature = String(tempValue, 1) + String(" ") + unit;
@@ -391,6 +412,44 @@ void connectWiFi() {
   Serial.println(WiFi.softAPIP());
 }
 
+void onSntpSync(struct timeval* tv) {
+  sntpEpochAtSync  = (uint32_t)tv->tv_sec;  // atomic 32-bit write, no race condition
+  sntpMillisAtSync = (uint32_t)millis();
+  sntpCallbackFired = true;
+  ntpSynced = true;
+  Serial.printf("SNTP sync: epoch %lu\n", (unsigned long)tv->tv_sec);
+}
+
+void initNtp() {
+  esp_sntp_set_time_sync_notification_cb(onSntpSync);
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  uint32_t started = millis();
+  while (!sntpCallbackFired && millis() - started < 10000) {
+    delay(200);
+  }
+  ntpSynced = sntpCallbackFired;
+  Serial.println(ntpSynced ? "NTP synced." : "NTP sync timed out.");
+}
+
+String getLocalTimeString() {
+  if (!infoTimeValid || !sntpCallbackFired) return "--:--";
+  // Use the epoch captured atomically in the SNTP callback, advanced by elapsed millis.
+  // This avoids time(NULL) which can oscillate while the SNTP task makes step corrections.
+  // uint32_t reads/writes are atomic on the 32-bit ESP32 CPU, so no race condition.
+  uint32_t utcNow = sntpEpochAtSync + (millis() - sntpMillisAtSync) / 1000UL;
+  if (utcNow < 1000000000UL) return "--:--";  // sanity check: before year 2001
+  long secsInDay = (long)(utcNow % 86400UL) + infoUtcOffsetSeconds;
+  secsInDay = ((secsInDay % 86400L) + 86400L) % 86400L;  // normalize to [0, 86400)
+  int h = (int)(secsInDay / 3600L);
+  int m = (int)((secsInDay % 3600L) / 60L);
+  bool pm = h >= 12;
+  if (h == 0) h = 12;
+  else if (h > 12) h -= 12;
+  char buf[10];
+  snprintf(buf, sizeof(buf), "%d:%02d%s", h, m, pm ? "P" : "A");
+  return String(buf);
+}
+
 void sendJson(int statusCode, JsonDocument& doc) {
   String payload;
   serializeJson(doc, payload);
@@ -417,6 +476,12 @@ void handleStatus() {
   doc["info_weather_code"] = infoWeatherCode;
   doc["info_latitude"] = infoLatitude;
   doc["info_longitude"] = infoLongitude;
+  doc["info_local_time"] = getLocalTimeString();
+  doc["info_timezone_abbr"] = infoTimezoneAbbr;
+  doc["info_utc_offset_seconds"] = infoUtcOffsetSeconds;
+  doc["debug_time_utc_epoch"] = (long)time(NULL);
+  doc["ntp_synced"] = ntpSynced;
+  doc["sntp_callback_fired"] = sntpCallbackFired;
   doc["debug_weather_api_code"] = debugLastWeatherCode;
   doc["debug_weather_api_payload"] = debugLastWeatherPayload;
 
@@ -718,6 +783,16 @@ void handleRoot() {
   html += String(infoLatitude, 4);
   html += ", ";
   html += String(infoLongitude, 4);
+  html += "<br><b>Local Time:</b> ";
+  html += htmlEscape(getLocalTimeString());
+  if (infoTimezoneAbbr.length() > 0) {
+    html += " (";
+    html += htmlEscape(infoTimezoneAbbr);
+    html += ")";
+  }
+  if (!sntpCallbackFired) {
+    html += " <span class='muted'>[NTP not synced]</span>";
+  }
   html += "</p><p><a href='/'>Refresh status</a> | <a href='/status'>Raw /status JSON</a></p></div>";
 
   html += "<div class='stack'>";
@@ -1180,17 +1255,23 @@ void drawFace() {
 void drawInfo() {
   display.clearBuffer();
 
-  String tempStr = infoTemperature;
-
   display.setFont(u8g2_font_fub17_tf);
+
+  // Local time at top
+  String timeStr = getLocalTimeString();
+  int timeW = display.getStrWidth(timeStr.c_str());
+  display.drawStr((128 - timeW) / 2, 22, timeStr.c_str());
+
+  // Temperature + weather icon centered below
+  String tempStr = infoTemperature;
   int tempW = display.getStrWidth(tempStr.c_str());
   const int iconW = 16;
   const int gap = 4;
   int totalW = tempW + gap + iconW;
   int tempX = (128 - totalW) / 2;
   if (tempX < 0) tempX = 0;
-  display.drawStr(tempX, 42, tempStr.c_str());
-  drawWeatherIcon(infoWeatherCode, tempX + tempW + gap, 26);
+  display.drawStr(tempX, 52, tempStr.c_str());
+  drawWeatherIcon(infoWeatherCode, tempX + tempW + gap, 36);
 
   display.sendBuffer();
 }
@@ -1244,6 +1325,9 @@ void setup() {
   }
 
   connectWiFi();
+  if (WiFi.status() == WL_CONNECTED) {
+    initNtp();
+  }
   speechText = currentIpAddress();
   serviceInfoData();
   setupServer();

@@ -110,3 +110,7 @@ python3 app.py --host 192.168.4.1 watch --interval 2
 
 - This is structured to match an expressive desk companion workflow on ESP32 + OLED with local reminders and desktop control.
 - You can extend behavior by adding sensors, touch input, audio output, or a richer desktop UI while keeping the same API.
+
+## Bug write-ups
+
+- [Local time display showed wrong time and alternated between two values](docs/bug-local-time-wrong-and-alternating.md)
